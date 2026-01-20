@@ -1,0 +1,21 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "legistar-cache",
+	"main": "src/index.js",
+	"compatibility_date": "2026-01-19",
+	"compatibility_flags": [
+		"global_fetch_strictly_public"
+	],
+	"kv_namespaces": [
+		{
+			"binding": "LEGISTAR_CACHE",
+			"id": "9876f9bf79b2496c948fcb51fb2b461b"
+		}
+	],
+	"assets": {
+		"directory": "./public"
+	},
+	"observability": {
+		"enabled": true
+	}
+}
