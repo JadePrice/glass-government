@@ -1,11 +1,3 @@
-{
-  "event_id": "string",
-  "title": "string",
-  "datetime": "ISO-8601 UTC",
-  "location": "string",
-  "source_url": "string"
-}
-
 # Madison & Dane County Government Calendar Plugin
 
 A WordPress plugin that fetches and displays government meeting calendars from City of Madison and Dane County, Wisconsin.
@@ -353,4 +345,12 @@ Built with focus on accessibility, security, and civic engagement for Madison an
 - Weekly cron scheduling
 - Accessible calendar display
 - Filter by jurisdiction
+
+Formats
+
+  "event_id": "string",
+  "title": "string",
+  "datetime": "ISO-8601 UTC",
+  "location": "string",
+  "source_url": "string"
 
