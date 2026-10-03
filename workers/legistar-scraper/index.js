@@ -29,7 +29,8 @@ async function handleRequest(request, event) {
     const events = parseDaneHTML(html)
 
     const body = JSON.stringify({
-      source: 'danecounty',
+      source: 'dane',
+      timezone: 'America/Chicago',
       fetched_count: events.length,
       count: events.length,
       generated: new Date().toISOString(),
@@ -48,13 +49,14 @@ async function handleRequest(request, event) {
 
   } catch (err) {
     return new Response(JSON.stringify({
-      source: 'danecounty',
+      source: 'dane',
       fetched_count: 0,
       count: 0,
       generated: new Date().toISOString(),
       events: [],
       error: err.message
     }), {
+      status: 502,
       headers: { 'Content-Type': 'application/json' }
     })
   }
@@ -86,13 +88,16 @@ function parseDaneHTML(html) {
     const location = cells[2].replace(/<[^>]+>/g, '').trim()
 
     const linkMatch = titleCell.match(/href="([^"]+)"/i)
-    const source_url = linkMatch ? linkMatch[1] : ''
 
-    // Convert date text into ISO string
-    const datetime = new Date(dateText).toISOString()
+    const datetime = parseUSDate(dateText)
+    if (!datetime) return // skip unparseable rows rather than failing the whole page
+
+    const href = linkMatch ? linkMatch[1].replace(/&amp;/g, '&') : ''
+    const source_url = href ? new URL(href, DANE_URL).href : ''
+    const idMatch = source_url.match(/[?&]ID=(\d+)/i)
 
     events.push({
-      event_id: `dane-${i}`,
+      event_id: idMatch ? idMatch[1] : `dane-${datetime}-${title}`,
       title,
       datetime,
       location,
@@ -101,4 +106,11 @@ function parseDaneHTML(html) {
   })
 
   return events
+}
+
+// "M/D/YYYY" -> local wall-clock "YYYY-MM-DDT00:00:00" (zone: America/Chicago)
+function parseUSDate(text) {
+  const m = text.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/)
+  if (!m) return null
+  return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}T00:00:00`
 }
