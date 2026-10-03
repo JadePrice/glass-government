@@ -1,24 +1,36 @@
 /**
  * Glass Government Legistar Worker
- * Version: 1.4.0
+ * Version: 2.0.0
  * - JSON first, XML fallback
- * - Cache with debug bypass
- * - HARD 30-day lookback + future events
- * - Debug mode returns full raw API response
- * - Madison returns detailed event objects (agenda, minutes, media, EventInSiteURL)
- * - Proper OData datetime filter
- * - Cloudflare cache 15 min
+ * - One event shape for every client (see normalizeEvent)
+ * - Upstream failures return 502 and are never cached
+ * - 30-day lookback + future events, 15 min Cloudflare cache
+ * - ?debug=1 only honoured with a matching X-Debug-Token (env.DEBUG_TOKEN)
  */
+
+const TIMEZONE = "America/Chicago";
+
+// Path segment -> Legistar API client slug and public site host.
+// NOTE: the "dane" slug is taken from the README / scraper host; confirm it
+// against https://webapi.legistar.com/v1/dane/events?$top=1
+const CLIENTS = {
+  madison: { slug: "madison", site: "madison.legistar.com" },
+  dane: { slug: "dane", site: "dane.legistar.com" }
+};
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const debug = url.searchParams.get("debug") === "1";
 
-    let client;
-    if (url.pathname === "/events/madison") client = "madison";
-    else if (url.pathname === "/events/dane") client = "danecounty";
-    else return new Response("Not found", { status: 404 });
+    const m = url.pathname.match(/^\/events\/([a-z]+)$/);
+    const client = m && CLIENTS[m[1]] ? m[1] : null;
+    if (!client) return new Response("Not found", { status: 404 });
+    const { slug, site } = CLIENTS[client];
+
+    const debug =
+      url.searchParams.get("debug") === "1" &&
+      !!env.DEBUG_TOKEN &&
+      request.headers.get("X-Debug-Token") === env.DEBUG_TOKEN;
 
     const cacheKey = new Request(url.origin + url.pathname);
     const cache = caches.default;
@@ -28,13 +40,12 @@ export default {
       if (cached) return cached;
     }
 
-    // 🔹 OData filter with correct datetime format
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 30);
-    const cutoffDateTime = cutoff.toISOString().split('.')[0]; // YYYY-MM-DDTHH:MM:SS
-    const legistarURL = `https://webapi.legistar.com/v1/${client}/events?$orderby=EventDate&$filter=EventDate ge datetime'${cutoffDateTime}'`;
+    const cutoffDateTime = cutoff.toISOString().split(".")[0]; // YYYY-MM-DDTHH:MM:SS
+    const legistarURL = `https://webapi.legistar.com/v1/${slug}/events?$orderby=EventDate&$filter=EventDate ge datetime'${cutoffDateTime}'`;
 
-    let events = [];
+    let events;
     try {
       const res = await fetch(legistarURL, {
         headers: {
@@ -42,123 +53,103 @@ export default {
           "User-Agent": "GlassGovernment/legistar-cache"
         }
       });
-
       const rawText = await res.text();
 
-      // DEBUG MODE: return raw API response immediately
       if (debug) {
-        return new Response(JSON.stringify({
-          source: client,
-          raw_response: rawText,
-          url: legistarURL
-        }, null, 2), {
-          headers: { "Content-Type": "application/json" }
-        });
+        return json({ source: client, status: res.status, raw_response: rawText, url: legistarURL }, 200, "no-store");
       }
 
-      let json;
-      try { json = JSON.parse(rawText); } catch { json = null; }
-
-      if (client === "madison" && json && Array.isArray(json)) {
-        // map full event details for Madison
-        events = json.map(e => ({
-          event_id: e.EventId,
-          guid: e.EventGuid,
-          last_modified: e.EventLastModifiedUtc,
-          body_name: e.EventBodyName,
-          date: e.EventDate,
-          time: e.EventTime,
-          location: e.EventLocation,
-          agenda_file: e.EventAgendaFile,
-          minutes_file: e.EventMinutesFile,
-          video: e.EventVideoPath || e.EventMedia,
-          url: e.EventInSiteURL,
-          status: e.EventAgendaStatusName,
-          comment: e.EventComment,
-          items: e.EventItems || []
-        })).filter(Boolean);
-      } else if (json && Array.isArray(json.value)) {
-        events = json.value.map(e => normalizeEvent(e, client)).filter(Boolean);
-      } else if (json && Array.isArray(json)) {
-        events = json.map(e => normalizeEvent(e, client)).filter(Boolean);
-      } else if (rawText.includes('<GranicusEvent>')) {
-        events = normalizeXML(rawText, client);
-      } else if (rawText.includes('<Error>')) {
-        const excMatch = rawText.match(/<ExceptionMessage>([\s\S]*?)<\/ExceptionMessage>/);
-        const excMsg = excMatch ? excMatch[1].trim() : 'Unknown Legistar API error';
-        if (debug) console.log(`Legistar API error for ${client}: ${excMsg}`);
+      if (!res.ok) {
+        return json({ source: client, error: `Legistar returned HTTP ${res.status}`, events: [] }, 502, "no-store");
       }
 
-      // 🔒 HARD FILTER: last 30 days + future
-      events = events.filter(e => e && isWithinLast30DaysOrFuture(e.date || e.datetime));
-
-      if (debug) console.log(`Worker v1.4.0: returned ${events.length} events for ${client}`);
-
+      events = parseEvents(rawText, site);
+      if (events === null) {
+        return json({ source: client, error: "Unrecognised Legistar response", events: [] }, 502, "no-store");
+      }
     } catch (err) {
-      if (debug) console.log('Worker fetch/parsing error:', err);
-      events = [];
+      return json({ source: client, error: "Legistar fetch failed", events: [] }, 502, "no-store");
     }
 
-    const body = JSON.stringify({
+    events = events.filter(e => isWithinLast30DaysOrFuture(e.datetime));
+
+    const response = json({
       source: client,
+      timezone: TIMEZONE,
       fetched_count: events.length,
       count: events.length,
       generated: new Date().toISOString(),
       events
-    });
+    }, 200, "public, max-age=900");
 
-    const response = new Response(body, {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": debug ? "no-store" : "public, max-age=900" // 15 min cache
-      }
-    });
-
-    if (!debug) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return response;
   }
 };
 
+function json(obj, status, cacheControl) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": cacheControl }
+  });
+}
+
 /* ---------------------------------------------------------
- * Normalizers
+ * Parsing / normalizing
  * --------------------------------------------------------- */
 
-function normalizeEvent(e, client) {
-  const dateField = e.EventDate || e.StartDate || e.MeetingDate;
-  const timeField = e.EventTime || e.StartTime || e.MeetingTime;
-  const dt = parseLegistarDate(dateField, timeField);
+// Returns an array of normalized events, or null if the body is not a
+// recognisable Legistar events response.
+function parseEvents(rawText, site) {
+  let data = null;
+  try { data = JSON.parse(rawText); } catch { /* fall through to XML */ }
 
-  if (!dt) return null;
+  const list = Array.isArray(data) ? data : data && Array.isArray(data.value) ? data.value : null;
+  if (list) return list.map(e => normalizeEvent(e, site)).filter(Boolean);
+
+  if (rawText.includes("<GranicusEvent>")) return normalizeXML(rawText, site);
+  return null;
+}
+
+/**
+ * Shared event shape:
+ *   event_id, guid, last_modified, title, datetime (local wall-clock,
+ *   YYYY-MM-DDTHH:MM:SS, no offset; zone is the top-level `timezone`),
+ *   location, source_url, agenda_file, minutes_file, video, status, comment
+ */
+function normalizeEvent(e, site) {
+  const datetime = parseLegistarDate(e.EventDate, e.EventTime);
+  if (!datetime || e.EventId == null) return null;
 
   return {
-    event_id: String(e.EventId || e.ID || "unknown"),
-    title: e.EventBodyName || e.MeetingName || "Meeting",
-    datetime: dt,
-    location: e.EventLocation || e.MeetingLocation || "",
-    source_url: `https://${client}.legistar.com/MeetingDetail.aspx?ID=${e.EventId || e.ID || ""}`
+    event_id: String(e.EventId),
+    guid: e.EventGuid || "",
+    last_modified: e.EventLastModifiedUtc || "",
+    title: e.EventBodyName || "Meeting",
+    datetime,
+    location: e.EventLocation || "",
+    source_url: e.EventInSiteURL || `https://${site}/MeetingDetail.aspx?ID=${e.EventId}`,
+    agenda_file: e.EventAgendaFile || "",
+    minutes_file: e.EventMinutesFile || "",
+    video: e.EventVideoPath || e.EventMedia || "",
+    status: e.EventAgendaStatusName || "",
+    comment: e.EventComment || ""
   };
 }
 
-function normalizeXML(xmlText, client) {
+function normalizeXML(xmlText, site) {
   const events = [];
-  const matches = [...xmlText.matchAll(/<GranicusEvent>([\s\S]*?)<\/GranicusEvent>/g)];
-
-  for (const m of matches) {
-    const get = tag =>
-      (m[1].match(new RegExp(`<${tag}>(.*?)<\/${tag}>`)) || [])[1] || "";
-
-    const dt = parseLegistarDate(get("EventDate"), get("EventTime"));
-    if (!dt) continue;
-
-    events.push({
-      event_id: get("EventId"),
-      title: get("EventBodyName") || "Meeting",
-      datetime: dt,
-      location: get("EventLocation") || "",
-      source_url: `https://${client}.legistar.com/MeetingDetail.aspx?ID=${get("EventId")}`
-    });
+  for (const m of xmlText.matchAll(/<GranicusEvent>([\s\S]*?)<\/GranicusEvent>/g)) {
+    const get = tag => (m[1].match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`)) || [])[1]?.trim() || "";
+    const ev = normalizeEvent({
+      EventId: get("EventId") || null,
+      EventBodyName: get("EventBodyName"),
+      EventDate: get("EventDate"),
+      EventTime: get("EventTime"),
+      EventLocation: get("EventLocation")
+    }, site);
+    if (ev) events.push(ev);
   }
-
   return events;
 }
 
@@ -166,28 +157,30 @@ function normalizeXML(xmlText, client) {
  * Date helpers
  * --------------------------------------------------------- */
 
+// Legistar dates are local (America/Chicago) wall-clock values. Keep them
+// that way; do not label them UTC.
 function parseLegistarDate(eventDate, eventTime) {
   if (!eventDate) return null;
 
-  const datePart = eventDate.split("T")[0];
-  if (!eventTime) return `${datePart}T12:00:00Z`;
+  const datePart = String(eventDate).split("T")[0];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
 
-  const m = eventTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-  if (!m) return `${datePart}T12:00:00Z`;
+  const m = eventTime && String(eventTime).match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!m) return `${datePart}T00:00:00`;
 
   let hour = parseInt(m[1], 10);
-  const minute = m[2];
   const meridian = m[3].toUpperCase();
-
   if (meridian === "PM" && hour !== 12) hour += 12;
   if (meridian === "AM" && hour === 12) hour = 0;
 
-  return `${datePart}T${String(hour).padStart(2, "0")}:${minute}:00Z`;
+  return `${datePart}T${String(hour).padStart(2, "0")}:${m[2]}:00`;
 }
 
-function isWithinLast30DaysOrFuture(iso) {
-  if (!iso) return false;
-  const dt = new Date(iso);
+// Compares the local date against the cutoff by date only, so it needs no
+// timezone arithmetic (the 1-day slop is irrelevant for a 30-day window).
+function isWithinLast30DaysOrFuture(local) {
+  if (!local) return false;
+  const dt = new Date(local + "Z");
   if (isNaN(dt.getTime())) return false;
 
   const cutoff = new Date();

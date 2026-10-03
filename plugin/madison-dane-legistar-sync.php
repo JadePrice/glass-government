@@ -55,15 +55,10 @@ function gg_legistar_deactivate() {
  * Fetch events from worker endpoint
  * 
  * @param string $client Client identifier (madison or dane)
- * @return array Worker response data
+ * @return array|null Worker response data, or null if the fetch failed
  */
 function gg_get_worker_events( $client ) {
-    $debug = get_option( 'gg_legistar_debug', false );
-    $url   = esc_url_raw( GG_LEGISTAR_WORKER_BASE . '/' . sanitize_key( $client ) );
-
-    if ( $debug ) {
-        $url = add_query_arg( 'debug', '1', $url );
-    }
+    $url = esc_url_raw( GG_LEGISTAR_WORKER_BASE . '/' . sanitize_key( $client ) );
 
     $response = wp_remote_get( $url, [
         'timeout'     => 30,
@@ -77,13 +72,13 @@ function gg_get_worker_events( $client ) {
 
     if ( is_wp_error( $response ) ) {
         gg_log_message( 'Worker fetch error for ' . $client . ': ' . $response->get_error_message() );
-        return [];
+        return null;
     }
 
     $code = wp_remote_retrieve_response_code( $response );
     if ( $code !== 200 ) {
         gg_log_message( 'Worker returned HTTP ' . $code . ' for ' . $client );
-        return [];
+        return null;
     }
 
     $body = wp_remote_retrieve_body( $response );
@@ -91,12 +86,16 @@ function gg_get_worker_events( $client ) {
 
     if ( json_last_error() !== JSON_ERROR_NONE ) {
         gg_log_message( 'JSON decode error: ' . json_last_error_msg() );
-        return [];
+        return null;
     }
 
-    if ( ! is_array( $data ) || empty( $data['events'] ) ) {
+    if ( ! is_array( $data ) || ! isset( $data['events'] ) || ! is_array( $data['events'] ) ) {
+        gg_log_message( 'Worker response missing events array for ' . $client );
+        return null;
+    }
+
+    if ( empty( $data['events'] ) ) {
         gg_log_message( 'Worker returned no events for ' . $client );
-        return [];
     }
 
     return $data;
@@ -244,18 +243,19 @@ function gg_deduplicate_venues() {
  * --------------------------------------------------------- */
 
 /**
- * Normalize datetime string to WordPress timezone
+ * Normalize a worker datetime (local wall-clock, no offset) to WordPress timezone
  * 
- * @param string $raw Raw datetime string
+ * @param string $raw      Raw datetime string, e.g. 2026-10-08T18:30:00
+ * @param string $timezone IANA zone the worker's values are expressed in
  * @return string|false Formatted datetime or false on failure
  */
-function gg_normalize_datetime( $raw ) {
+function gg_normalize_datetime( $raw, $timezone = 'America/Chicago' ) {
     if ( empty( $raw ) ) {
         return false;
     }
 
     try {
-        $dt = new DateTime( $raw, new DateTimeZone( 'UTC' ) );
+        $dt = new DateTime( $raw, new DateTimeZone( $timezone ) );
         $dt->setTimezone( wp_timezone() );
         return $dt->format( 'Y-m-d H:i:s' );
     } catch ( Exception $e ) {
@@ -312,9 +312,11 @@ function gg_set_tec_event_meta( $event_id, $datetime, $venue_id = 0 ) {
  * 
  * @param array  $events        Event data from worker
  * @param string $category_name Category for events
+ * @param string $client        Worker client key (madison|dane), scopes event IDs
+ * @param string $timezone      IANA zone of the worker's datetimes
  * @return array Sync results
  */
-function gg_sync_events_to_tec( $events, $category_name ) {
+function gg_sync_events_to_tec( $events, $category_name, $client, $timezone = 'America/Chicago' ) {
     $results = [
         'fetched'  => 0,
         'inserted' => 0,
@@ -345,13 +347,13 @@ function gg_sync_events_to_tec( $events, $category_name ) {
         $results['fetched']++;
 
         // Validate required fields
-        if ( empty( $event['EventId'] ) || empty( $event['EventDate'] ) ) {
+        if ( empty( $event['event_id'] ) || empty( $event['datetime'] ) ) {
             $results['skipped']++;
             continue;
         }
 
         // Normalize datetime
-        $datetime = gg_normalize_datetime( $event['EventDate'] );
+        $datetime = gg_normalize_datetime( $event['datetime'], $timezone );
         if ( ! $datetime || ! gg_is_within_sync_window( $datetime ) ) {
             $results['skipped']++;
             continue;
@@ -359,24 +361,25 @@ function gg_sync_events_to_tec( $events, $category_name ) {
 
         // Handle venue
         $venue_id = 0;
-        if ( ! empty( $event['EventLocation'] ) ) {
-            $venue_id = gg_get_or_create_venue( $event['EventLocation'] );
+        if ( ! empty( $event['location'] ) ) {
+            $venue_id = gg_get_or_create_venue( $event['location'] );
         }
 
-        // Check for existing event
+        // Check for existing event (IDs are only unique within one Legistar client)
+        $legistar_key = sanitize_key( $client ) . ':' . sanitize_text_field( $event['event_id'] );
         $existing = get_posts([
             'post_type'      => 'tribe_events',
             'posts_per_page' => 1,
             'meta_query'     => [
                 [
                     'key'   => '_gg_legistar_event_id',
-                    'value' => sanitize_text_field( $event['EventId'] ),
+                    'value' => $legistar_key,
                 ],
             ],
         ]);
 
-        $event_title = ! empty( $event['EventBodyName'] ) 
-            ? sanitize_text_field( $event['EventBodyName'] )
+        $event_title = ! empty( $event['title'] ) 
+            ? sanitize_text_field( $event['title'] )
             : __( 'Legistar Event', 'gg-legistar-sync' );
 
         $post_data = [
@@ -404,10 +407,10 @@ function gg_sync_events_to_tec( $events, $category_name ) {
 
         // Set metadata
         gg_set_tec_event_meta( $event_id, $datetime, $venue_id );
-        update_post_meta( $event_id, '_gg_legistar_event_id', sanitize_text_field( $event['EventId'] ) );
+        update_post_meta( $event_id, '_gg_legistar_event_id', $legistar_key );
         
-        if ( ! empty( $event['EventInSiteURL'] ) ) {
-            update_post_meta( $event_id, '_gg_legistar_url', esc_url_raw( $event['EventInSiteURL'] ) );
+        if ( ! empty( $event['source_url'] ) ) {
+            update_post_meta( $event_id, '_gg_legistar_url', esc_url_raw( $event['source_url'] ) );
         }
 
         // Set category
@@ -420,8 +423,8 @@ function gg_sync_events_to_tec( $events, $category_name ) {
             $results['preview'][] = [
                 'title'    => $event_title,
                 'datetime' => $datetime,
-                'venue'    => ! empty( $event['EventLocation'] ) ? $event['EventLocation'] : '',
-                'url'      => ! empty( $event['EventInSiteURL'] ) ? $event['EventInSiteURL'] : '',
+                'venue'    => ! empty( $event['location'] ) ? $event['location'] : '',
+                'url'      => ! empty( $event['source_url'] ) ? $event['source_url'] : '',
             ];
         }
     }
@@ -478,27 +481,33 @@ function gg_perform_sync() {
         'success' => false,
     ];
 
-    // Sync Madison
-    $madison_data = gg_get_worker_events( 'madison' );
-    if ( ! empty( $madison_data['events'] ) ) {
-        $results['madison'] = gg_sync_events_to_tec( 
-            $madison_data['events'], 
-            'City of Madison'
+    $clients = [
+        'madison' => 'City of Madison',
+        'dane'    => 'Dane County',
+    ];
+
+    $ok = 0;
+    foreach ( $clients as $client => $category ) {
+        $data = gg_get_worker_events( $client );
+        if ( null === $data ) {
+            $results[ $client ] = [ 'error' => true, 'fetched' => 0, 'inserted' => 0, 'updated' => 0, 'skipped' => 0, 'preview' => [] ];
+            continue;
+        }
+        $ok++;
+        $results[ $client ] = gg_sync_events_to_tec(
+            $data['events'],
+            $category,
+            $client,
+            ! empty( $data['timezone'] ) ? $data['timezone'] : 'America/Chicago'
         );
     }
 
-    // Sync Dane County
-    $dane_data = gg_get_worker_events( 'dane' );
-    if ( ! empty( $dane_data['events'] ) ) {
-        $results['dane'] = gg_sync_events_to_tec( 
-            $dane_data['events'], 
-            'Dane County'
-        );
+    // Success means every client fetched; last_sync only advances then.
+    $results['success'] = ( count( $clients ) === $ok );
+    if ( $ok > 0 ) {
+        update_option( 'gg_legistar_last_sync', time() );
     }
-
-    $results['success'] = true;
-    update_option( 'gg_legistar_last_sync', time() );
-    update_option( 'gg_legistar_last_results', $results );
+    update_option( 'gg_legistar_last_results', $results, false );
 
     return $results;
 }
@@ -561,8 +570,10 @@ function gg_legistar_admin_page() {
                 add_settings_error( 
                     'gg_legistar', 
                     'sync_complete', 
-                    __( 'Sync completed successfully!', 'gg-legistar-sync' ), 
-                    'success' 
+                    $results['success']
+                        ? __( 'Sync completed successfully.', 'gg-legistar-sync' )
+                        : __( 'Sync incomplete: at least one source failed to load. Enable debug mode and check the log.', 'gg-legistar-sync' ),
+                    $results['success'] ? 'success' : 'error'
                 );
                 break;
                 
@@ -638,7 +649,7 @@ function gg_legistar_admin_page() {
                             echo esc_html( 
                                 sprintf( 
                                     __( '%s ago', 'gg-legistar-sync' ),
-                                    human_time_diff( $last_sync, current_time( 'timestamp' ) )
+                                    human_time_diff( $last_sync, time() )
                                 )
                             );
                         } else {
@@ -709,6 +720,10 @@ function gg_legistar_admin_page() {
                         <?php esc_html_e( 'Results', 'gg-legistar-sync' ); ?>
                     </h2>
                     
+                    <?php if ( ! empty( $last_results[ $client ]['error'] ) ) : ?>
+                    <p class="gg-badge gg-badge-warning"><?php esc_html_e( 'Source failed to load on the last sync.', 'gg-legistar-sync' ); ?></p>
+                    <?php endif; ?>
+
                     <div class="gg-stats">
                         <div class="gg-stat">
                             <span class="gg-stat-label"><?php esc_html_e( 'Fetched', 'gg-legistar-sync' ); ?></span>
